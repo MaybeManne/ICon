@@ -1,4 +1,4 @@
-built some cool stuff w/ MIT people
+# I-CON PLayground setup info: https://docs.google.com/document/d/17_T8g84FppfSUDfr_bBV7X5j_rq1Twlb-2yr6PQ73Dc/edit?tab=t.0 
 
 <div align="center">
 

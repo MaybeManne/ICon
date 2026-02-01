@@ -357,6 +357,22 @@ See playground/CUSTOM_DATA_GUIDE.md for complete examples.""",
              "or 'resize:28,grayscale' for smaller images",
     )
 
+    # Utility features
+    util_group = parser.add_argument_group('Utility features',
+        'Informational and export tools (do not affect training)')
+    util_group.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Validate configuration and print summary without training. "
+             "Shows device resolution, dataset info, expected outputs, then exits.",
+    )
+    util_group.add_argument(
+        "--export_summary",
+        action="store_true",
+        help="After training, export a human-readable run_summary.txt file "
+             "with metadata, results, and reproducibility info.",
+    )
+
     return parser
 
 
@@ -385,6 +401,414 @@ def resolve_device_arg(args: argparse.Namespace) -> str:
 
     # Use the explicit --device argument
     return args.device
+
+
+def run_dry_run(args: argparse.Namespace) -> None:
+    """
+    Print configuration summary without training.
+
+    This validates the configuration, resolves device, checks dataset info,
+    and prints expected outputs without executing any training or allocating
+    GPU memory beyond device detection.
+    """
+    import torch
+    from datetime import datetime
+    from playground.playground_config import PlaygroundConfig, quick_config
+    from playground.device import select_device
+
+    print("\n" + "=" * 60)
+    print("DRY RUN - Configuration Preview")
+    print("=" * 60)
+
+    # Build configuration (same logic as run_experiment)
+    if args.preset:
+        config = quick_config(
+            preset=args.preset,
+            epochs=args.epochs,
+            output_dir=args.output_dir,
+        )
+        config_source = f"preset: {args.preset}"
+    else:
+        # Parse custom dataset argument if provided
+        custom_type, custom_path, custom_class = None, None, None
+        dataset_to_use = args.dataset
+
+        if args.custom_dataset:
+            parts = args.custom_dataset.split(':')
+            if len(parts) < 2:
+                print("\nError: --custom_dataset format should be 'type:path' or 'custom:path:ClassName'")
+                sys.exit(1)
+            custom_type = parts[0]
+            custom_path = parts[1]
+            if custom_type == 'custom' and len(parts) >= 3:
+                custom_class = parts[2]
+            dataset_to_use = "custom"
+
+        # Determine visualization mode
+        if args.no_viz:
+            viz_mode = "none"
+        elif args.save_epoch_gifs:
+            viz_mode = "both"
+        else:
+            viz_mode = args.viz_mode
+
+        config = PlaygroundConfig(
+            dataset=dataset_to_use,
+            backbone=args.backbone,
+            icon_mode=args.icon_mode,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            temperature=args.temperature,
+            embedding_dim=args.embedding_dim,
+            divergence=args.divergence,
+            optimizer=args.optimizer,
+            weight_decay=args.weight_decay,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            save_checkpoints=args.save_checkpoints,
+            custom_dataset_type=custom_type,
+            custom_dataset_path=custom_path,
+            custom_dataset_class=custom_class,
+            viz_mode=viz_mode,
+            gif_every=args.gif_every,
+            gif_method=args.gif_method,
+            gif_fps=args.gif_fps,
+            gif_max_points=args.gif_max_points,
+            gif_overlay=args.gif_overlay,
+            save_frames=not args.no_save_frames,
+        )
+        config_source = "CLI arguments"
+
+    # === CONFIGURATION ===
+    print("\n[Configuration]")
+    print(f"  Source:         {config_source}")
+    if config.custom_dataset_path:
+        print(f"  Dataset:        custom ({config.custom_dataset_type})")
+        print(f"  Dataset path:   {config.custom_dataset_path}")
+    else:
+        print(f"  Dataset:        {config.dataset}")
+    print(f"  Backbone:       {config.backbone}")
+    print(f"  I-Con mode:     {config.icon_mode}")
+    print(f"  Embedding dim:  {config.embedding_dim}")
+    print(f"  Epochs:         {config.epochs}")
+    print(f"  Batch size:     {config.batch_size}")
+    print(f"  Optimizer:      {config.optimizer}")
+    print(f"  Learning rate:  {config.learning_rate}")
+    print(f"  Temperature:    {config.temperature}")
+    print(f"  Divergence:     {config.divergence}")
+    print(f"  Seed:           {config.seed}")
+
+    # === DEVICE RESOLUTION ===
+    print("\n[Device Resolution]")
+    device_arg = resolve_device_arg(args)
+    print(f"  Requested:      {device_arg}")
+
+    try:
+        resolved_device = select_device(device_arg, verbose=False)
+        print(f"  Resolved:       {resolved_device.type}")
+        if resolved_device.type == "cuda":
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"  GPU:            {gpu_name}")
+        elif resolved_device.type == "mps":
+            print(f"  GPU:            Apple Silicon (MPS)")
+    except RuntimeError as e:
+        print(f"  ERROR:          {e}")
+        print(f"  (Training would fail with this device setting)")
+
+    # === DATASET SANITY ===
+    print("\n[Dataset Info]")
+
+    # Get dataset info without loading full data
+    dataset_info = _get_dataset_info_for_dry_run(config)
+
+    print(f"  Train samples:  {dataset_info['train_samples']}")
+    print(f"  Val samples:    {dataset_info['val_samples']}")
+    print(f"  Num classes:    {dataset_info['num_classes']}")
+    print(f"  Train batches:  {dataset_info['train_batches']}")
+    print(f"  Val batches:    {dataset_info['val_batches']}")
+
+    # Warnings
+    if dataset_info['val_batches'] == 0:
+        print(f"  WARNING:        Val batches = 0! Dataset may be too small for batch_size={config.batch_size}")
+    if dataset_info['train_samples'] < 100:
+        print(f"  WARNING:        Very small dataset ({dataset_info['train_samples']} samples). Results may be unreliable.")
+
+    # === VISUALIZATION PLAN ===
+    print("\n[Visualization Plan]")
+    print(f"  Viz mode:       {config.viz_mode}")
+    gif_enabled = config.viz_mode in ('gif', 'both')
+    print(f"  GIF enabled:    {gif_enabled}")
+    if gif_enabled:
+        print(f"  GIF every:      {config.gif_every} epoch(s)")
+        print(f"  GIF method:     {config.gif_method}")
+        print(f"  Max points:     {config.gif_max_points}")
+
+    # === EXPECTED OUTPUTS ===
+    print("\n[Expected Outputs]")
+
+    # Compute run directory name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{config.dataset}_{config.icon_mode}_{timestamp}"
+    run_dir = Path(config.output_dir) / run_name
+
+    print(f"  Output dir:     {run_dir}")
+    print(f"\n  Files that would be created:")
+    print(f"    - config.json")
+    print(f"    - embeddings.npz")
+    print(f"    - logs.json")
+    print(f"    - final_model.pt")
+
+    if not args.no_probe:
+        print(f"    - probe_results.json")
+
+    if not args.no_viz:
+        print(f"    - training_curves.png")
+        print(f"    - embeddings_pca.png")
+        print(f"    - embeddings_umap.png")
+        if args.tsne:
+            print(f"    - embeddings_tsne.png")
+        print(f"    - distance_histograms.png")
+        print(f"    - experiment_summary.png")
+
+    if gif_enabled:
+        print(f"    - training_dynamics.gif")
+        if config.save_frames:
+            print(f"    - epoch_frames/ (individual PNGs)")
+        print(f"    - epoch_embeddings/ (per-epoch data)")
+
+    if args.export_summary:
+        print(f"    - run_summary.txt")
+
+    print("\n" + "=" * 60)
+    print("Dry run complete. No training was executed.")
+    print("=" * 60)
+    sys.exit(0)
+
+
+def _get_dataset_info_for_dry_run(config) -> dict:
+    """
+    Get dataset info for dry run without loading full data.
+
+    Returns approximate counts based on known dataset sizes or
+    checks custom dataset paths.
+    """
+    # Known dataset sizes
+    known_datasets = {
+        'cifar10': {'train': 50000, 'val': 10000, 'classes': 10},
+        'cifar100': {'train': 50000, 'val': 10000, 'classes': 100},
+        'mnist': {'train': 60000, 'val': 10000, 'classes': 10},
+        'stl10': {'train': 5000, 'val': 8000, 'classes': 10},  # train only, not train+unlabeled
+    }
+
+    if config.dataset in known_datasets:
+        info = known_datasets[config.dataset]
+        train_samples = info['train']
+        val_samples = info['val']
+        num_classes = info['classes']
+    elif config.custom_dataset_path:
+        # For custom datasets, try to estimate or return "unknown"
+        train_samples = "unknown"
+        val_samples = "unknown"
+        num_classes = "unknown"
+
+        # Try to peek at folder structure for folder datasets
+        if config.custom_dataset_type == 'folder':
+            try:
+                from pathlib import Path
+                custom_path = Path(config.custom_dataset_path)
+                if custom_path.exists():
+                    # Count class folders
+                    class_dirs = [d for d in custom_path.iterdir() if d.is_dir()]
+                    num_classes = len(class_dirs)
+                    # Rough count of images
+                    total = sum(
+                        len(list(d.glob('*.[jJ][pP][gG]')) + list(d.glob('*.[pP][nN][gG]')))
+                        for d in class_dirs
+                    )
+                    train_samples = int(total * 0.8)  # Assume 80/20 split
+                    val_samples = total - train_samples
+            except Exception:
+                pass
+    else:
+        train_samples = "unknown"
+        val_samples = "unknown"
+        num_classes = "unknown"
+
+    # Calculate batch counts
+    if isinstance(train_samples, int):
+        # Account for contrastive mode (batch_size // num_views)
+        effective_batch = config.batch_size // 2 if config.icon_mode in [
+            "simclr_like", "sne_like", "tsne_like", "cluster_like",
+            "barlow_twins_like", "vicreg_like", "debiasing_like"
+        ] else config.batch_size
+        train_batches = train_samples // effective_batch
+    else:
+        train_batches = "unknown"
+
+    if isinstance(val_samples, int):
+        effective_batch = config.batch_size // 2 if config.icon_mode in [
+            "simclr_like", "sne_like", "tsne_like", "cluster_like",
+            "barlow_twins_like", "vicreg_like", "debiasing_like"
+        ] else config.batch_size
+        # Val loader now uses drop_last=False, so we ceil
+        val_batches = (val_samples + effective_batch - 1) // effective_batch
+    else:
+        val_batches = "unknown"
+
+    return {
+        'train_samples': train_samples,
+        'val_samples': val_samples,
+        'num_classes': num_classes,
+        'train_batches': train_batches,
+        'val_batches': val_batches,
+    }
+
+
+def export_run_summary(
+    run_dir: Path,
+    config,
+    results: dict,
+    probe_results: dict = None,
+    knn_results: dict = None,
+    sep_results: dict = None,
+    device_str: str = None,
+) -> Path:
+    """
+    Export a human-readable run_summary.txt file.
+
+    This is pure logging - no new computations, no changes to existing outputs.
+
+    Args:
+        run_dir: Path to the run directory
+        config: PlaygroundConfig used for the run
+        results: Results dict from training
+        probe_results: Linear probe results (optional)
+        knn_results: k-NN probe results (optional)
+        sep_results: Separability analysis results (optional)
+        device_str: Device string used for training
+
+    Returns:
+        Path to the created summary file
+    """
+    import subprocess
+    from datetime import datetime
+
+    summary_path = run_dir / "run_summary.txt"
+
+    lines = []
+    lines.append("=" * 60)
+    lines.append("I-CON PLAYGROUND - RUN SUMMARY")
+    lines.append("=" * 60)
+
+    # === RUN METADATA ===
+    lines.append("\n[Run Metadata]")
+    lines.append(f"  Timestamp:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Git commit hash
+    try:
+        git_hash = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+            cwd=run_dir.parent
+        ).decode('utf-8').strip()[:8]
+    except Exception:
+        git_hash = "unknown"
+    lines.append(f"  Git commit:     {git_hash}")
+
+    # Command reconstruction
+    cmd_parts = ["python -m playground.playground_cli"]
+    cmd_parts.append(f"--dataset {config.dataset}")
+    cmd_parts.append(f"--backbone {config.backbone}")
+    cmd_parts.append(f"--icon_mode {config.icon_mode}")
+    cmd_parts.append(f"--epochs {config.epochs}")
+    cmd_parts.append(f"--batch_size {config.batch_size}")
+    cmd_parts.append(f"--embedding_dim {config.embedding_dim}")
+    cmd_parts.append(f"--seed {config.seed}")
+    lines.append(f"  Command:        {' '.join(cmd_parts)}")
+
+    # === HARDWARE ===
+    lines.append("\n[Hardware]")
+    lines.append(f"  Device type:    {device_str or 'unknown'}")
+
+    import torch
+    if device_str == "cuda" and torch.cuda.is_available():
+        lines.append(f"  GPU name:       {torch.cuda.get_device_name(0)}")
+    elif device_str == "mps":
+        lines.append(f"  GPU name:       Apple Silicon (MPS)")
+
+    # === TRAINING ===
+    lines.append("\n[Training]")
+    lines.append(f"  Epochs:         {config.epochs}")
+
+    logs = results.get("logs", {})
+    train_losses = logs.get("train_losses", [])
+    val_losses = logs.get("val_losses", [])
+
+    if train_losses:
+        lines.append(f"  Final train loss: {train_losses[-1]:.6f}")
+    if val_losses:
+        lines.append(f"  Final val loss:   {val_losses[-1]:.6f}")
+
+    # === PROBES ===
+    lines.append("\n[Evaluation Probes]")
+
+    if probe_results:
+        lines.append(f"  Linear probe accuracy: {probe_results.get('test_accuracy', 'N/A'):.4f}"
+                     if isinstance(probe_results.get('test_accuracy'), (int, float))
+                     else f"  Linear probe accuracy: N/A")
+    else:
+        lines.append(f"  Linear probe accuracy: not run")
+
+    if knn_results:
+        lines.append(f"  k-NN accuracy:         {knn_results.get('test_accuracy', 'N/A'):.4f}"
+                     if isinstance(knn_results.get('test_accuracy'), (int, float))
+                     else f"  k-NN accuracy:         N/A")
+    else:
+        lines.append(f"  k-NN accuracy:         not run")
+
+    if sep_results:
+        lines.append(f"  Separability ratio:    {sep_results.get('separability_ratio', 'N/A'):.4f}"
+                     if isinstance(sep_results.get('separability_ratio'), (int, float))
+                     else f"  Separability ratio:    N/A")
+    else:
+        lines.append(f"  Separability ratio:    not run")
+
+    # === ARTIFACTS ===
+    lines.append("\n[Artifacts]")
+
+    artifact_checks = [
+        ("training_dynamics.gif", "Animation"),
+        ("embeddings_pca.png", "PCA plot"),
+        ("embeddings_umap.png", "UMAP plot"),
+        ("embeddings.npz", "Embeddings"),
+        ("final_model.pt", "Model weights"),
+        ("config.json", "Configuration"),
+        ("logs.json", "Training logs"),
+        ("probe_results.json", "Probe results"),
+    ]
+
+    for filename, description in artifact_checks:
+        filepath = run_dir / filename
+        if filepath.exists():
+            lines.append(f"  {filename:<25} ({description})")
+
+    # === REPRODUCIBILITY ===
+    lines.append("\n[Reproducibility]")
+    lines.append(f"  Config file:    {run_dir / 'config.json'}")
+    lines.append(f"  Seed:           {config.seed}")
+    lines.append(f"  Run directory:  {run_dir}")
+
+    lines.append("\n" + "=" * 60)
+    lines.append("Generated by I-Con Playground")
+    lines.append("=" * 60)
+
+    # Write file
+    with open(summary_path, 'w') as f:
+        f.write('\n'.join(lines))
+
+    return summary_path
 
 
 def run_regen_gif(args: argparse.Namespace) -> None:
@@ -928,6 +1352,11 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     run_dir = Path(results["paths"]["run_dir"])
 
+    # Initialize probe result variables (for export_summary)
+    probe_results = None
+    knn_results = None
+    sep_results = None
+
     # Run linear probe
     if not args.no_probe and len(results["embeddings"]) > 0:
         print("\n" + "=" * 60)
@@ -1063,6 +1492,19 @@ def run_experiment(args: argparse.Namespace) -> None:
     print(f"    python -m playground.playground_cli --regen_gif --load_dir \"{run_dir}\"")
     print("=" * 60)
 
+    # Export run summary if requested
+    if args.export_summary:
+        summary_path = export_run_summary(
+            run_dir=run_dir,
+            config=config,
+            results=results,
+            probe_results=probe_results,
+            knn_results=knn_results,
+            sep_results=sep_results,
+            device_str=device,
+        )
+        print(f"\n  Run summary exported to: {summary_path}")
+
 
 def main():
     """Main entry point for the CLI."""
@@ -1079,7 +1521,9 @@ def main():
         """)
 
     # Handle different modes
-    if args.regen_gif:
+    if args.dry_run:
+        run_dry_run(args)
+    elif args.regen_gif:
         run_regen_gif(args)
     elif args.probe_only:
         run_probe_only(args)
